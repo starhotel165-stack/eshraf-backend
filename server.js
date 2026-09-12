@@ -602,39 +602,51 @@ ${safeTruncate(text, 1500)}`;
 });
 
 /* ---------------------------------------------------------------------
-   رصد یوتیوب (کلیدواژه‌ی سوریه، کش هر ۲ ساعت)
+   رصد یوتیوب (کلیدواژه‌ی سوریه)
    چون اتصال مستقیم از سرور ایرانی به یوتیوب فیلتره، از طریق واسط
    Cloudflare (همون Workerی که برای وبهوک تلگرام هم استفاده می‌شه) رد می‌شیم.
+
+   منطق ذخیره‌سازی: ویدیوهای هر روز جدا و به‌صورت تجمیعی ذخیره می‌شن —
+   یعنی هر بار که جست‌وجوی جدید انجام می‌شه، نتایج به ویدیوهای همون روز
+   اضافه می‌شن (نه جایگزین)، و روز بعد از صفر (یه کلید جدید) شروع می‌شه.
+   این‌جوری آرشیو کامل هر روز هم به‌صورت خودکار نگه داشته می‌شه.
 --------------------------------------------------------------------- */
-const YOUTUBE_CACHE_MS = 2 * 60 * 60 * 1000;
+const YOUTUBE_FETCH_INTERVAL_MS = 2 * 60 * 60 * 1000; // هر ۲ ساعت یک‌بار واقعاً از یوتیوب می‌گیریم (صرفه‌جویی سهمیه)
 const YOUTUBE_KEYWORD = 'سوريا أخبار';
 
 app.get('/api/youtube-videos', requireAuth, async (req, res) => {
-  const cacheKey = 'youtube_videos_cache';
-  const cachedRaw = await redis.get(cacheKey);
-  let cached = cachedRaw ? JSON.parse(cachedRaw) : null;
   const now = Date.now();
+  const today = toDamascusDateString(now);
+  const dayKey = `youtube_videos:${today}`;
+  const lastFetchKey = `youtube_last_fetch:${today}`;
 
-  if (cached && now - cached.fetchedAt < YOUTUBE_CACHE_MS) {
-    return res.json({ videos: cached.videos, fetchedAt: cached.fetchedAt });
+  const dayRaw = await redis.get(dayKey);
+  let dayData = dayRaw ? JSON.parse(dayRaw) : { videos: [], fetchedAt: null };
+
+  const lastFetchRaw = await redis.get(lastFetchKey);
+  const lastFetch = lastFetchRaw ? parseInt(lastFetchRaw, 10) : 0;
+  const needsFetch = now - lastFetch >= YOUTUBE_FETCH_INTERVAL_MS;
+
+  if (!needsFetch) {
+    return res.json({ videos: dayData.videos, fetchedAt: dayData.fetchedAt });
   }
   if (!YOUTUBE_API_KEY) {
-    if (cached) return res.json({ videos: cached.videos, fetchedAt: cached.fetchedAt, error: 'کلید YOUTUBE_API_KEY تنظیم نشده.' });
-    return res.json({ videos: [], error: 'کلید YOUTUBE_API_KEY تنظیم نشده.' });
+    return res.json({ videos: dayData.videos, fetchedAt: dayData.fetchedAt, error: 'کلید YOUTUBE_API_KEY تنظیم نشده.' });
   }
   if (!RELAY_URL || !RELAY_SECRET) {
-    if (cached) return res.json({ videos: cached.videos, fetchedAt: cached.fetchedAt, error: 'RELAY_URL یا RELAY_SECRET تنظیم نشده.' });
-    return res.json({ videos: [], error: 'RELAY_URL یا RELAY_SECRET تنظیم نشده.' });
+    return res.json({ videos: dayData.videos, fetchedAt: dayData.fetchedAt, error: 'RELAY_URL یا RELAY_SECRET تنظیم نشده.' });
   }
 
+  await redis.set(lastFetchKey, String(now));
+
   try {
-    const proxyUrl = `${RELAY_URL.replace(/\/$/, '')}/youtube?secret=${encodeURIComponent(RELAY_SECRET)}&q=${encodeURIComponent(YOUTUBE_KEYWORD)}&key=${encodeURIComponent(YOUTUBE_API_KEY)}`;
+    const proxyUrl = `${RELAY_URL}/youtube?secret=${encodeURIComponent(RELAY_SECRET)}&q=${encodeURIComponent(YOUTUBE_KEYWORD)}&key=${encodeURIComponent(YOUTUBE_API_KEY)}`;
     const apiRes = await fetch(proxyUrl);
     const rawBody = await apiRes.text();
     if (!apiRes.ok) throw new Error(`واسط یوتیوب خطای ${apiRes.status} برگرداند`);
     const data = JSON.parse(rawBody);
 
-    const videos = (data.items || []).map((item) => {
+    const newVideos = (data.items || []).map((item) => {
       const snippet = item.snippet || {};
       const thumbs = snippet.thumbnails || {};
       return {
@@ -646,12 +658,29 @@ app.get('/api/youtube-videos', requireAuth, async (req, res) => {
       };
     }).filter((v) => v.videoId);
 
-    await redis.set(cacheKey, JSON.stringify({ fetchedAt: now, videos }));
-    res.json({ videos, fetchedAt: now });
+    // ادغام با ویدیوهای قبلیِ همین روز، بدون تکراری
+    const merged = [...dayData.videos];
+    for (const v of newVideos) {
+      const idx = merged.findIndex((m) => m.videoId === v.videoId);
+      if (idx >= 0) merged[idx] = v;
+      else merged.unshift(v);
+    }
+    merged.sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0));
+
+    await redis.set(dayKey, JSON.stringify({ videos: merged, fetchedAt: now }));
+    res.json({ videos: merged, fetchedAt: now });
   } catch (e) {
-    if (cached) return res.json({ videos: cached.videos, fetchedAt: cached.fetchedAt, error: e.message });
-    res.json({ videos: [], error: e.message });
+    res.json({ videos: dayData.videos, fetchedAt: dayData.fetchedAt, error: e.message });
   }
+});
+
+// آرشیو ویدیوهای یوتیوب یک روز خاص
+app.get('/api/youtube-archive', requireAuth, async (req, res) => {
+  const dateParam = req.query.date;
+  if (!dateParam) return res.json({ videos: [] });
+  const raw = await redis.get(`youtube_videos:${dateParam}`);
+  const data = raw ? JSON.parse(raw) : null;
+  res.json({ videos: data ? data.videos : [] });
 });
 
 /* ---------------------------------------------------------------------
