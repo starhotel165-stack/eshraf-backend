@@ -855,16 +855,16 @@ app.get('/api/breaking-news', requireAuth, async (req, res) => {
 --------------------------------------------------------------------- */
 const LIVE_TV_CHANNELS = [
   { key: 'ch1', name: 'تلفزیون سوریه (Syria TV)', videoId: 'h6cB5IUmVF0' },
-  { key: 'ch2', name: 'کانال ۲', videoId: 'bNyUyrR0PHo' },
-  { key: 'ch3', name: 'کانال ۳', videoId: 'DtAklq2xM0o' },
-  { key: 'ch4', name: 'کانال ۴', videoId: 'n7eQejkXbnM' },
-  { key: 'ch5', name: 'کانال ۵', videoId: 'ppgTP8xQQsM' },
-  { key: 'ch6', name: 'کانال ۶', videoId: 'oIuWBQeglfs' },
-  { key: 'ch7', name: 'کانال ۷', videoId: '_kBTqvs0NDw' },
-  { key: 'ch8', name: 'کانال ۸', videoId: '93g513Uth98' },
-  { key: 'ch9', name: 'کانال ۹', videoId: 'O1pGmVtj2Y8' },
-  { key: 'ch10', name: 'کانال ۱۰', videoId: 'A1cZxijueg4' },
-  { key: 'ch11', name: 'کانال ۱۱', videoId: 'cQw5nxK8is4' },
+  { key: 'ch2', name: 'الجزیره', videoId: 'bNyUyrR0PHo' },
+  { key: 'ch3', name: 'العربی', videoId: 'DtAklq2xM0o' },
+  { key: 'ch4', name: 'العربیه', videoId: 'n7eQejkXbnM' },
+  { key: 'ch5', name: 'اسکای‌نیوز عربیه', videoId: 'ppgTP8xQQsM' },
+  { key: 'ch6', name: 'المیادین', videoId: 'oIuWBQeglfs' },
+  { key: 'ch7', name: 'الإخباریه', videoId: '_kBTqvs0NDw' },
+  { key: 'ch8', name: 'فرانس ۲۴ عربی', videoId: '93g513Uth98' },
+  { key: 'ch9', name: 'بی‌بی‌سی عربی', videoId: 'O1pGmVtj2Y8' },
+  { key: 'ch10', name: 'رؤیا', videoId: 'A1cZxijueg4' },
+  { key: 'ch11', name: 'الشرق', videoId: 'cQw5nxK8is4' },
 ];
 
 app.get('/api/live-tv', requireTabAccess('livetv'), async (req, res) => {
