@@ -849,61 +849,26 @@ app.get('/api/breaking-news', requireAuth, async (req, res) => {
 });
 
 /* ---------------------------------------------------------------------
-   پخش زنده‌ی تلویزیون‌های سوریه (فقط اونایی که رو یوتیوب پخش زنده دارن)
+   پخش زنده‌ی تلویزیون‌های سوریه — لیست ثابت از ویدیوهای پخش زنده‌ی
+   دائمی هر کانال (بدون نیاز به API یوتیوب یا واسط Cloudflare، چون
+   خودِ آدرس ویدیو ثابته و همیشه همون پخش زنده رو نشون می‌ده).
 --------------------------------------------------------------------- */
 const LIVE_TV_CHANNELS = [
-  { key: 'syriatv', name: 'تلفزیون سوریه (Syria TV)', channelId: 'UCJsZ22yL1IW0R2u0jnnyYog' },
-  { key: 'alikhbariah', name: 'الإخباریة السوریة (رسانه‌ی رسمی دولتی)', channelId: 'UClm30t2F4FHzzkN9Irtr-8A' },
+  { key: 'ch1', name: 'تلفزیون سوریه (Syria TV)', videoId: 'h6cB5IUmVF0' },
+  { key: 'ch2', name: 'کانال ۲', videoId: 'bNyUyrR0PHo' },
+  { key: 'ch3', name: 'کانال ۳', videoId: 'DtAklq2xM0o' },
+  { key: 'ch4', name: 'کانال ۴', videoId: 'n7eQejkXbnM' },
+  { key: 'ch5', name: 'کانال ۵', videoId: 'ppgTP8xQQsM' },
+  { key: 'ch6', name: 'کانال ۶', videoId: 'oIuWBQeglfs' },
+  { key: 'ch7', name: 'کانال ۷', videoId: '_kBTqvs0NDw' },
+  { key: 'ch8', name: 'کانال ۸', videoId: '93g513Uth98' },
+  { key: 'ch9', name: 'کانال ۹', videoId: 'O1pGmVtj2Y8' },
+  { key: 'ch10', name: 'کانال ۱۰', videoId: 'A1cZxijueg4' },
+  { key: 'ch11', name: 'کانال ۱۱', videoId: 'cQw5nxK8is4' },
 ];
-const LIVE_TV_CACHE_MS = 5 * 60 * 1000; // هر ۵ دقیقه چک می‌شه
-
-async function checkChannelLive(channel) {
-  const proxyUrl = `${RELAY_URL}/youtube-live?secret=${encodeURIComponent(RELAY_SECRET)}&channelId=${encodeURIComponent(channel.channelId)}&key=${encodeURIComponent(YOUTUBE_API_KEY)}`;
-  const res = await fetch(proxyUrl);
-  const rawBody = await res.text();
-  if (!res.ok) throw new Error(`واسط یوتیوب خطای ${res.status} برگرداند`);
-  const data = JSON.parse(rawBody);
-
-  const item = (data.items || [])[0];
-  if (!item) return { ...channel, isLive: false };
-
-  const snippet = item.snippet || {};
-  const thumbs = snippet.thumbnails || {};
-  return {
-    ...channel,
-    isLive: true,
-    videoId: item.id && item.id.videoId,
-    title: snippet.title || '',
-    thumbnail: (thumbs.medium || thumbs.default || {}).url || null,
-  };
-}
 
 app.get('/api/live-tv', requireTabAccess('livetv'), async (req, res) => {
-  const now = Date.now();
-  const cacheKey = 'live_tv_cache';
-  const cachedRaw = await redis.get(cacheKey);
-  let cached = cachedRaw ? JSON.parse(cachedRaw) : null;
-
-  if (cached && now - cached.fetchedAt < LIVE_TV_CACHE_MS) {
-    return res.json({ channels: cached.channels, fetchedAt: cached.fetchedAt });
-  }
-  if (!YOUTUBE_API_KEY) {
-    if (cached) return res.json({ channels: cached.channels, fetchedAt: cached.fetchedAt, error: 'کلید YOUTUBE_API_KEY تنظیم نشده.' });
-    return res.json({ channels: LIVE_TV_CHANNELS.map((c) => ({ ...c, isLive: false })), error: 'کلید YOUTUBE_API_KEY تنظیم نشده.' });
-  }
-  if (!RELAY_URL || !RELAY_SECRET) {
-    if (cached) return res.json({ channels: cached.channels, fetchedAt: cached.fetchedAt, error: 'RELAY_URL یا RELAY_SECRET تنظیم نشده.' });
-    return res.json({ channels: LIVE_TV_CHANNELS.map((c) => ({ ...c, isLive: false })), error: 'RELAY_URL یا RELAY_SECRET تنظیم نشده.' });
-  }
-
-  try {
-    const channels = await Promise.all(LIVE_TV_CHANNELS.map((c) => checkChannelLive(c).catch(() => ({ ...c, isLive: false }))));
-    await redis.set(cacheKey, JSON.stringify({ fetchedAt: now, channels }));
-    res.json({ channels, fetchedAt: now });
-  } catch (e) {
-    if (cached) return res.json({ channels: cached.channels, fetchedAt: cached.fetchedAt, error: e.message });
-    res.json({ channels: LIVE_TV_CHANNELS.map((c) => ({ ...c, isLive: false })), error: e.message });
-  }
+  res.json({ channels: LIVE_TV_CHANNELS });
 });
 
 /* ---------------------------------------------------------------------
