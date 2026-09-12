@@ -19,6 +19,9 @@ const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || '';
 const TELEGRAM_CHANNEL_USERNAME = (process.env.TELEGRAM_CHANNEL_USERNAME || 'syriamonitoring').toLowerCase();
 const COOKIE_SECURE = process.env.COOKIE_SECURE !== 'false'; // پیش‌فرض true (چون پشت HTTPS هستیم)
+// آدرس و رمز مشترک Worker واسط رو Cloudflare — برای دورزدن فیلترینگ تلگرام/یوتیوب
+const RELAY_URL = (process.env.RELAY_URL || '').replace(/\/$/, '');
+const RELAY_SECRET = process.env.RELAY_SECRET || '';
 
 const MAX_STORED_POSTS = 5000;
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // ۳۰ روز
@@ -172,11 +175,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
   }
 
   const update = req.body || {};
-  // لاگ موقت برای دیباگ — بعد از پیداکردن مشکل حذفش می‌کنیم
-  console.log('=== وبهوک دریافت شد ===');
-  console.log(JSON.stringify(update));
-  console.log('========================');
-
   const msg = update.channel_post || update.edited_channel_post;
   if (!msg) return res.status(200).send('OK');
 
@@ -212,6 +210,84 @@ app.post('/api/telegram-webhook', async (req, res) => {
 });
 
 /* ---------------------------------------------------------------------
+   اسکرپ صفحه‌ی عمومی تلگرام (از طریق واسط Cloudflare) — چون تلگرام
+   پیام‌های ارسالی توسط ربات‌های دیگه (مثل Inoreader) رو هیچ‌وقت از
+   طریق وبهوک به ما نمی‌ده (محدودیت رسمی خودِ تلگرام)، این روش
+   جایگزین برای گرفتن همون پیام‌هاست.
+--------------------------------------------------------------------- */
+function decodeHtmlEntities(str) {
+  return str
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&nbsp;/g, ' ');
+}
+function stripHtmlTags(html) {
+  return decodeHtmlEntities(html.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').trim());
+}
+
+const SCRAPE_INTERVAL_MS = 3 * 60 * 1000; // حداکثر هر ۳ دقیقه یک‌بار
+
+async function scrapeChannelViaRelay() {
+  if (!RELAY_URL || !RELAY_SECRET) throw new Error('RELAY_URL یا RELAY_SECRET تنظیم نشده.');
+
+  const scrapeUrl = `${RELAY_URL}/scrape?secret=${encodeURIComponent(RELAY_SECRET)}&channel=${encodeURIComponent(TELEGRAM_CHANNEL_USERNAME)}`;
+  const res = await fetch(scrapeUrl);
+  if (!res.ok) throw new Error(`واسط اسکرپ خطای ${res.status} برگرداند`);
+  const html = await res.text();
+
+  const chunks = html.split('class="tgme_widget_message_wrap').slice(1);
+  const posts = [];
+
+  for (const chunk of chunks) {
+    const postMatch = chunk.match(/data-post="([^"]+)"/);
+    if (!postMatch) continue;
+    const textMatch = chunk.match(/class="tgme_widget_message_text js-message_text"[^>]*>([\s\S]*?)<\/div>/);
+    const timeMatch = chunk.match(/<time datetime="([^"]+)"/);
+
+    const text = textMatch ? stripHtmlTags(textMatch[1]) : '';
+    if (!text) continue;
+
+    posts.push({
+      id: `scrape_${postMatch[1]}`,
+      messageId: parseInt(postMatch[1].split('/')[1], 10) || 0,
+      text,
+      date: timeMatch ? new Date(timeMatch[1]).getTime() : Date.now(),
+      link: `https://t.me/${postMatch[1]}`,
+    });
+  }
+
+  return posts;
+}
+
+async function maybeScrapeChannel() {
+  const now = Date.now();
+  const lastRaw = await redis.get('scrape_last_at');
+  const last = lastRaw ? parseInt(lastRaw, 10) : 0;
+  if (now - last < SCRAPE_INTERVAL_MS) return;
+
+  await redis.set('scrape_last_at', String(now)); // فوری ثبت می‌کنیم تا درخواست‌های هم‌زمان دوباره اسکرپ نکنن
+
+  try {
+    const scraped = await scrapeChannelViaRelay();
+    if (scraped.length === 0) return;
+
+    const existingRaw = await redis.get('posts');
+    let list = existingRaw ? JSON.parse(existingRaw) : [];
+
+    for (const post of scraped) {
+      const idx = list.findIndex((p) => p.id === post.id);
+      if (idx >= 0) list[idx] = post;
+      else list.unshift(post);
+    }
+
+    list.sort((a, b) => b.date - a.date);
+    list = list.slice(0, MAX_STORED_POSTS);
+    await redis.set('posts', JSON.stringify(list));
+  } catch (e) {
+    console.error('خطا در اسکرپ کانال:', e.message);
+  }
+}
+
+/* ---------------------------------------------------------------------
    کمکی: محاسبه‌ی شروع «امروز» به وقت دمشق (UTC+3، بدون تغییر ساعت تابستانی)
 --------------------------------------------------------------------- */
 function getDamascusDayStartMs(nowMs) {
@@ -230,6 +306,7 @@ function toDamascusDateString(ms) {
    پوشش زنده اخبار (فقط امروز) + آرشیو (بر اساس تاریخ)
 --------------------------------------------------------------------- */
 app.get('/api/posts', requireAuth, async (req, res) => {
+  await maybeScrapeChannel();
   const raw = await redis.get('posts');
   const allPosts = raw ? JSON.parse(raw) : [];
   const now = Date.now();
@@ -239,6 +316,7 @@ app.get('/api/posts', requireAuth, async (req, res) => {
 });
 
 app.get('/api/archive', requireAuth, async (req, res) => {
+  await maybeScrapeChannel();
   const dateParam = req.query.date;
   if (!dateParam) return res.json({ posts: [] });
   const raw = await redis.get('posts');
@@ -530,8 +608,6 @@ ${safeTruncate(text, 1500)}`;
 --------------------------------------------------------------------- */
 const YOUTUBE_CACHE_MS = 2 * 60 * 60 * 1000;
 const YOUTUBE_KEYWORD = 'سوريا أخبار';
-const RELAY_URL = process.env.RELAY_URL || ''; // مثلاً https://eshraf-relay.xxx.workers.dev
-const RELAY_SECRET = process.env.RELAY_SECRET || '';
 
 app.get('/api/youtube-videos', requireAuth, async (req, res) => {
   const cacheKey = 'youtube_videos_cache';
