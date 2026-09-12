@@ -94,6 +94,9 @@ async function verifyPassword(password, saltHex, expectedHashHex) {
 /* ---------------------------------------------------------------------
    احراز هویت — نشست با کوکی امن (HttpOnly + Secure + SameSite=Strict)
 --------------------------------------------------------------------- */
+// کلید هر تب/نوار — برای دسترسی‌دهی جزء‌به‌جزء تو پنل مدیریت کاربران
+const ALL_TAB_KEYS = ['live', 'wordcloud', 'youtube', 'archive', 'psyop', 'infographic', 'scenario', 'caption'];
+
 async function getSession(req) {
   const cookies = parseCookies(req);
   const token = cookies.eshraf_session;
@@ -115,6 +118,41 @@ function requireAuth(req, res, next) {
     req.session = session;
     next();
   });
+}
+
+function requireAdmin(req, res, next) {
+  getSession(req).then((session) => {
+    if (!session) return res.status(401).json({ ok: false, error: 'لطفاً ابتدا وارد شوید.' });
+    if (session.role !== 'admin') return res.status(403).json({ ok: false, error: 'فقط مدیر کل به این بخش دسترسی دارد.' });
+    req.session = session;
+    next();
+  });
+}
+
+// دسترسی به یک تب خاص: مدیر کل همیشه مجازه؛ کاربر عادی فقط اگه تو allowedTabs باشه
+function requireTabAccess(tabKey) {
+  return (req, res, next) => {
+    getSession(req).then((session) => {
+      if (!session) return res.status(401).json({ ok: false, error: 'لطفاً ابتدا وارد شوید.' });
+      const allowed = session.role === 'admin' || (Array.isArray(session.allowedTabs) && session.allowedTabs.includes(tabKey));
+      if (!allowed) return res.status(403).json({ ok: false, error: 'به این بخش دسترسی نداری.' });
+      req.session = session;
+      next();
+    });
+  };
+}
+
+// دسترسی اگه کاربر حداقل به یکی از چندتا تب دسترسی داشته باشه (مثلاً یه endpoint که هم تو psyop هم تو infographic استفاده می‌شه)
+function requireAnyTabAccess(...tabKeys) {
+  return (req, res, next) => {
+    getSession(req).then((session) => {
+      if (!session) return res.status(401).json({ ok: false, error: 'لطفاً ابتدا وارد شوید.' });
+      const allowed = session.role === 'admin' || (Array.isArray(session.allowedTabs) && tabKeys.some((t) => session.allowedTabs.includes(t)));
+      if (!allowed) return res.status(403).json({ ok: false, error: 'به این بخش دسترسی نداری.' });
+      req.session = session;
+      next();
+    });
+  };
 }
 
 // محدودیت تلاش ورود (جلوگیری از حمله‌ی brute-force)
@@ -143,13 +181,16 @@ app.post('/api/auth/login', async (req, res) => {
   const valid = await verifyPassword(password, user.salt, user.hash);
   if (!valid) return res.status(401).json({ ok: false, error: 'نام‌کاربری یا رمز عبور اشتباه است.' });
 
+  const role = user.role === 'admin' ? 'admin' : 'user';
+  const allowedTabs = role === 'admin' ? ALL_TAB_KEYS : (Array.isArray(user.allowedTabs) ? user.allowedTabs : []);
+
   const token = crypto.randomBytes(32).toString('hex');
-  await redis.set(`session:${token}`, JSON.stringify({ username: user.username }), { EX: SESSION_TTL_SECONDS });
+  await redis.set(`session:${token}`, JSON.stringify({ username: user.username, role, allowedTabs }), { EX: SESSION_TTL_SECONDS });
   setCookie(res, 'eshraf_session', token, SESSION_TTL_SECONDS);
 
   await redis.del(`login_attempts:${ip}`); // ورود موفق -> شمارنده ریست بشه
 
-  res.json({ ok: true, username: user.username });
+  res.json({ ok: true, username: user.username, role, allowedTabs });
 });
 
 app.post('/api/auth/logout', async (req, res) => {
@@ -162,7 +203,69 @@ app.post('/api/auth/logout', async (req, res) => {
 app.get('/api/auth/me', async (req, res) => {
   const session = await getSession(req);
   if (!session) return res.status(401).json({ ok: false });
-  res.json({ ok: true, username: session.username });
+  res.json({ ok: true, username: session.username, role: session.role || 'user', allowedTabs: session.allowedTabs || [] });
+});
+
+/* ---------------------------------------------------------------------
+   پنل مدیریت کاربران — فقط مدیر کل
+--------------------------------------------------------------------- */
+app.get('/api/admin/users', requireAdmin, async (req, res) => {
+  const keys = [];
+  for await (const key of redis.scanIterator({ MATCH: 'user:*' })) keys.push(key);
+
+  const users = [];
+  for (const key of keys) {
+    const raw = await redis.get(key);
+    if (!raw) continue;
+    const u = JSON.parse(raw);
+    users.push({
+      username: u.username,
+      role: u.role === 'admin' ? 'admin' : 'user',
+      allowedTabs: u.role === 'admin' ? ALL_TAB_KEYS : (Array.isArray(u.allowedTabs) ? u.allowedTabs : []),
+    });
+  }
+  users.sort((a, b) => a.username.localeCompare(b.username));
+  res.json({ ok: true, users, allTabs: ALL_TAB_KEYS });
+});
+
+app.post('/api/admin/users', requireAdmin, async (req, res) => {
+  const username = (req.body.username || '').trim();
+  const password = req.body.password || '';
+  const role = req.body.role === 'admin' ? 'admin' : 'user';
+  const allowedTabs = role === 'user' && Array.isArray(req.body.allowedTabs)
+    ? req.body.allowedTabs.filter((t) => ALL_TAB_KEYS.includes(t))
+    : [];
+
+  if (!username || !password) return res.status(400).json({ ok: false, error: 'نام‌کاربری و رمز عبور الزامی است.' });
+  if (password.length < 8) return res.status(400).json({ ok: false, error: 'رمز عبور باید حداقل ۸ کاراکتر باشد.' });
+
+  const existing = await redis.get(`user:${username}`);
+  if (existing) return res.status(400).json({ ok: false, error: 'این نام‌کاربری قبلاً استفاده شده است.' });
+
+  const { hash, salt } = await hashPassword(password);
+  await redis.set(`user:${username}`, JSON.stringify({ username, hash, salt, role, allowedTabs }));
+
+  res.json({ ok: true });
+});
+
+app.patch('/api/admin/users/:username', requireAdmin, async (req, res) => {
+  const { username } = req.params;
+  const raw = await redis.get(`user:${username}`);
+  if (!raw) return res.status(404).json({ ok: false, error: 'کاربر پیدا نشد.' });
+
+  const user = JSON.parse(raw);
+  if (typeof req.body.role === 'string') user.role = req.body.role === 'admin' ? 'admin' : 'user';
+  if (Array.isArray(req.body.allowedTabs)) user.allowedTabs = req.body.allowedTabs.filter((t) => ALL_TAB_KEYS.includes(t));
+
+  await redis.set(`user:${username}`, JSON.stringify(user));
+  res.json({ ok: true });
+});
+
+app.delete('/api/admin/users/:username', requireAdmin, async (req, res) => {
+  const { username } = req.params;
+  if (username === req.session.username) return res.status(400).json({ ok: false, error: 'نمی‌توانی حساب خودت را حذف کنی.' });
+  await redis.del(`user:${username}`);
+  res.json({ ok: true });
 });
 
 /* ---------------------------------------------------------------------
@@ -311,7 +414,7 @@ function toDamascusDateString(ms) {
 /* ---------------------------------------------------------------------
    پوشش زنده اخبار (فقط امروز) + آرشیو (بر اساس تاریخ)
 --------------------------------------------------------------------- */
-app.get('/api/posts', requireAuth, async (req, res) => {
+app.get('/api/posts', requireTabAccess('live'), async (req, res) => {
   await maybeScrapeChannel();
   const raw = await redis.get('posts');
   const allPosts = raw ? JSON.parse(raw) : [];
@@ -321,7 +424,7 @@ app.get('/api/posts', requireAuth, async (req, res) => {
   res.json({ posts });
 });
 
-app.get('/api/archive', requireAuth, async (req, res) => {
+app.get('/api/archive', requireTabAccess('archive'), async (req, res) => {
   await maybeScrapeChannel();
   const dateParam = req.query.date;
   if (!dateParam) return res.json({ posts: [] });
@@ -331,7 +434,7 @@ app.get('/api/archive', requireAuth, async (req, res) => {
   res.json({ posts: matched });
 });
 
-app.post('/api/admin/clear-posts', requireAuth, async (req, res) => {
+app.post('/api/admin/clear-posts', requireTabAccess('live'), async (req, res) => {
   await redis.del('posts');
   res.json({ ok: true });
 });
@@ -363,7 +466,7 @@ function computeTopWords(posts, limit = 15) {
     .map(([word, count]) => ({ word, count }));
 }
 
-app.get('/api/wordcloud', requireAuth, async (req, res) => {
+app.get('/api/wordcloud', requireTabAccess('wordcloud'), async (req, res) => {
   const raw = await redis.get('posts');
   const allPosts = raw ? JSON.parse(raw) : [];
   const now = Date.now();
@@ -456,12 +559,12 @@ ${joined}`;
   }
 }
 
-app.get('/api/psyop-report', requireAuth, async (req, res) => {
+app.get('/api/psyop-report', requireAnyTabAccess('psyop', 'infographic'), async (req, res) => {
   const raw = await redis.get('psyop_report_latest');
   res.json({ report: raw ? JSON.parse(raw) : null });
 });
 
-app.post('/api/psyop-report/generate', requireAuth, async (req, res) => {
+app.post('/api/psyop-report/generate', requireTabAccess('psyop'), async (req, res) => {
   const waitSec = await checkAiToolCooldown('psyop_last_call');
   if (waitSec > 0) return res.status(429).json({ ok: false, error: `لطفاً ${waitSec} ثانیه‌ی دیگر دوباره تلاش کن.` });
 
@@ -523,7 +626,7 @@ function clampCount(value) {
   return Math.min(Math.max(n, 1), 5);
 }
 
-app.post('/api/scenario/generate', requireAuth, async (req, res) => {
+app.post('/api/scenario/generate', requireTabAccess('scenario'), async (req, res) => {
   const waitSec = await checkAiToolCooldown('scenario_last_call');
   if (waitSec > 0) return res.status(429).json({ ok: false, error: `لطفاً ${waitSec} ثانیه‌ی دیگر دوباره تلاش کن.` });
 
@@ -563,7 +666,7 @@ ${safeTruncate(text, 1500)}`;
   }
 });
 
-app.post('/api/caption/generate', requireAuth, async (req, res) => {
+app.post('/api/caption/generate', requireTabAccess('caption'), async (req, res) => {
   const waitSec = await checkAiToolCooldown('caption_last_call');
   if (waitSec > 0) return res.status(429).json({ ok: false, error: `لطفاً ${waitSec} ثانیه‌ی دیگر دوباره تلاش کن.` });
 
@@ -620,7 +723,7 @@ ${safeTruncate(text, 1500)}`;
 const YOUTUBE_FETCH_INTERVAL_MS = 2 * 60 * 60 * 1000; // هر ۲ ساعت یک‌بار واقعاً از یوتیوب می‌گیریم (صرفه‌جویی سهمیه)
 const YOUTUBE_KEYWORD = 'سوريا أخبار';
 
-app.get('/api/youtube-videos', requireAuth, async (req, res) => {
+app.get('/api/youtube-videos', requireTabAccess('youtube'), async (req, res) => {
   const now = Date.now();
   const today = toDamascusDateString(now);
   const dayKey = `youtube_videos:${today}`;
@@ -681,7 +784,7 @@ app.get('/api/youtube-videos', requireAuth, async (req, res) => {
 });
 
 // آرشیو ویدیوهای یوتیوب یک روز خاص
-app.get('/api/youtube-archive', requireAuth, async (req, res) => {
+app.get('/api/youtube-archive', requireTabAccess('youtube'), async (req, res) => {
   const dateParam = req.query.date;
   if (!dateParam) return res.json({ videos: [] });
   const raw = await redis.get(`youtube_videos:${dateParam}`);
