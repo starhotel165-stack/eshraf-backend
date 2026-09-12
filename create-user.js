@@ -1,9 +1,14 @@
 /**
- * اسکریپت ساخت کاربر (اجرا فقط رو خودِ سرور، مستقیم از خط فرمان)
+ * اسکریپت ساخت کاربر مدیر کل (اجرا فقط رو خودِ سرور، مستقیم از خط فرمان)
+ * این فقط برای ساخت اولین حساب مدیره؛ کاربرهای عادی بعداً از پنل مدیریت
+ * کاربران (تو خودِ سایت) با دسترسی محدود به تب‌های دلخواه ساخته می‌شن.
+ *
  * استفاده: node create-user.js <username> <password>
  */
 const crypto = require('crypto');
 const { createClient } = require('redis');
+
+const ALL_TAB_KEYS = ['live', 'wordcloud', 'youtube', 'archive', 'psyop', 'infographic', 'scenario', 'caption'];
 
 function hashPassword(password) {
   return new Promise((resolve, reject) => {
@@ -36,8 +41,8 @@ async function main() {
   }
 
   const { hash, salt } = await hashPassword(password);
-  await redis.set(`user:${username}`, JSON.stringify({ username, hash, salt }));
-  console.log(`کاربر «${username}» با موفقیت ساخته شد.`);
+  await redis.set(`user:${username}`, JSON.stringify({ username, hash, salt, role: 'admin', allowedTabs: ALL_TAB_KEYS }));
+  console.log(`کاربر «${username}» با دسترسی مدیر کل ساخته شد.`);
 
   await redis.quit();
 }
