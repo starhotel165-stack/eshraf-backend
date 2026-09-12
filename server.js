@@ -172,6 +172,11 @@ app.post('/api/telegram-webhook', async (req, res) => {
   }
 
   const update = req.body || {};
+  // لاگ موقت برای دیباگ — بعد از پیداکردن مشکل حذفش می‌کنیم
+  console.log('=== وبهوک دریافت شد ===');
+  console.log(JSON.stringify(update));
+  console.log('========================');
+
   const msg = update.channel_post || update.edited_channel_post;
   if (!msg) return res.status(200).send('OK');
 
