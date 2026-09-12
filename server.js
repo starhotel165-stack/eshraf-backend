@@ -226,14 +226,15 @@ function stripHtmlTags(html) {
 
 const SCRAPE_INTERVAL_MS = 3 * 60 * 1000; // حداکثر هر ۳ دقیقه یک‌بار
 
-async function scrapeChannelViaRelay() {
+async function fetchTelegramPreviewHtml(channelUsername) {
   if (!RELAY_URL || !RELAY_SECRET) throw new Error('RELAY_URL یا RELAY_SECRET تنظیم نشده.');
-
-  const scrapeUrl = `${RELAY_URL}/scrape?secret=${encodeURIComponent(RELAY_SECRET)}&channel=${encodeURIComponent(TELEGRAM_CHANNEL_USERNAME)}`;
+  const scrapeUrl = `${RELAY_URL}/scrape?secret=${encodeURIComponent(RELAY_SECRET)}&channel=${encodeURIComponent(channelUsername)}`;
   const res = await fetch(scrapeUrl);
   if (!res.ok) throw new Error(`واسط اسکرپ خطای ${res.status} برگرداند`);
-  const html = await res.text();
+  return res.text();
+}
 
+function parseTelegramPreviewPosts(html) {
   const chunks = html.split('class="tgme_widget_message_wrap').slice(1);
   const posts = [];
 
@@ -247,7 +248,7 @@ async function scrapeChannelViaRelay() {
     if (!text) continue;
 
     posts.push({
-      id: `scrape_${postMatch[1]}`,
+      id: postMatch[1],
       messageId: parseInt(postMatch[1].split('/')[1], 10) || 0,
       text,
       date: timeMatch ? new Date(timeMatch[1]).getTime() : Date.now(),
@@ -256,6 +257,11 @@ async function scrapeChannelViaRelay() {
   }
 
   return posts;
+}
+
+async function scrapeChannelViaRelay() {
+  const html = await fetchTelegramPreviewHtml(TELEGRAM_CHANNEL_USERNAME);
+  return parseTelegramPreviewPosts(html).map((p) => ({ ...p, id: `scrape_${p.id}` }));
 }
 
 async function maybeScrapeChannel() {
@@ -681,6 +687,62 @@ app.get('/api/youtube-archive', requireAuth, async (req, res) => {
   const raw = await redis.get(`youtube_videos:${dateParam}`);
   const data = raw ? JSON.parse(raw) : null;
   res.json({ videos: data ? data.videos : [] });
+});
+
+/* ---------------------------------------------------------------------
+   نوار «خبر فوری» — کانال عمومی الجزیره، ترجمه‌شده به فارسی با دیپ‌سیک،
+   از طریق واسط Cloudflare خونده می‌شه (چون t.me تو ایران فیلتره).
+--------------------------------------------------------------------- */
+const BREAKING_NEWS_CHANNEL = 'aljazeeraBrk';
+const BREAKING_NEWS_CACHE_MS = 3 * 60 * 1000;
+const MAX_BREAKING_NEWS = 8;
+
+async function translateBatchToPersian(texts) {
+  if (!DEEPSEEK_API_KEY) return texts;
+  if (texts.length === 0) return [];
+
+  const numbered = texts.map((t, i) => `${i + 1}. ${safeTruncate(t, 500)}`).join('\n');
+  const prompt = `متن‌های زیر خبرهای عربی هستند. هرکدام را به فارسیِ روان و خبری ترجمه کن.
+فقط یک آرایه‌ی JSON از رشته‌ها برگردان، دقیقاً به همان ترتیب و همان تعداد ورودی، بدون هیچ توضیح یا متن اضافه.
+
+${numbered}`;
+
+  try {
+    const result = await callDeepSeekJson(prompt, 'تو فقط یک آرایه‌ی JSON از رشته‌های ترجمه‌شده برمی‌گردانی، بدون هیچ متن اضافه.');
+    if (Array.isArray(result) && result.length === texts.length) return result;
+    return texts;
+  } catch {
+    return texts;
+  }
+}
+
+app.get('/api/breaking-news', requireAuth, async (req, res) => {
+  const now = Date.now();
+  const cacheKey = 'breaking_news_cache';
+  const cachedRaw = await redis.get(cacheKey);
+  let cached = cachedRaw ? JSON.parse(cachedRaw) : null;
+
+  if (cached && now - cached.fetchedAt < BREAKING_NEWS_CACHE_MS) {
+    return res.json({ items: cached.items });
+  }
+
+  try {
+    const html = await fetchTelegramPreviewHtml(BREAKING_NEWS_CHANNEL);
+    const raw = parseTelegramPreviewPosts(html).reverse().slice(0, MAX_BREAKING_NEWS);
+    if (raw.length === 0) {
+      if (cached) return res.json({ items: cached.items });
+      return res.json({ items: [] });
+    }
+
+    const translations = await translateBatchToPersian(raw.map((p) => p.text));
+    const items = raw.map((p, i) => ({ id: p.id, link: p.link, date: p.date, text: translations[i] || p.text }));
+
+    await redis.set(cacheKey, JSON.stringify({ fetchedAt: now, items }));
+    res.json({ items });
+  } catch (e) {
+    if (cached) return res.json({ items: cached.items, error: e.message });
+    res.json({ items: [], error: e.message });
+  }
 });
 
 /* ---------------------------------------------------------------------
