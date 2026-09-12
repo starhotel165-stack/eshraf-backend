@@ -1,0 +1,45 @@
+/**
+ * اسکریپت ساخت کاربر (اجرا فقط رو خودِ سرور، مستقیم از خط فرمان)
+ * استفاده: node create-user.js <username> <password>
+ */
+const crypto = require('crypto');
+const { createClient } = require('redis');
+
+function hashPassword(password) {
+  return new Promise((resolve, reject) => {
+    const salt = crypto.randomBytes(16);
+    crypto.scrypt(password, salt, 64, { N: 16384, r: 8, p: 1 }, (err, derivedKey) => {
+      if (err) return reject(err);
+      resolve({ hash: derivedKey.toString('hex'), salt: salt.toString('hex') });
+    });
+  });
+}
+
+async function main() {
+  const [username, password] = process.argv.slice(2);
+  if (!username || !password) {
+    console.error('استفاده: node create-user.js <username> <password>');
+    process.exit(1);
+  }
+  if (password.length < 8) {
+    console.error('رمز عبور باید حداقل ۸ کاراکتر باشد.');
+    process.exit(1);
+  }
+
+  const redis = createClient({ url: process.env.REDIS_URL || 'redis://127.0.0.1:6379' });
+  await redis.connect();
+
+  const existing = await redis.get(`user:${username}`);
+  if (existing) {
+    console.error(`کاربر «${username}» از قبل وجود دارد. برای تغییر رمز، اول با redis-cli حذفش کن: DEL user:${username}`);
+    process.exit(1);
+  }
+
+  const { hash, salt } = await hashPassword(password);
+  await redis.set(`user:${username}`, JSON.stringify({ username, hash, salt }));
+  console.log(`کاربر «${username}» با موفقیت ساخته شد.`);
+
+  await redis.quit();
+}
+
+main();
