@@ -327,11 +327,12 @@ function stripHtmlTags(html) {
   return decodeHtmlEntities(html.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').trim());
 }
 
-const SCRAPE_INTERVAL_MS = 3 * 60 * 1000; // حداکثر هر ۳ دقیقه یک‌بار
+const SCRAPE_INTERVAL_MS = 2 * 60 * 1000; // حداکثر هر ۲ دقیقه یک‌بار (حالا که خودکار پس‌زمینه اجرا می‌شه)
 
-async function fetchTelegramPreviewHtml(channelUsername) {
+async function fetchTelegramPreviewHtml(channelUsername, beforeId) {
   if (!RELAY_URL || !RELAY_SECRET) throw new Error('RELAY_URL یا RELAY_SECRET تنظیم نشده.');
-  const scrapeUrl = `${RELAY_URL}/scrape?secret=${encodeURIComponent(RELAY_SECRET)}&channel=${encodeURIComponent(channelUsername)}`;
+  let scrapeUrl = `${RELAY_URL}/scrape?secret=${encodeURIComponent(RELAY_SECRET)}&channel=${encodeURIComponent(channelUsername)}`;
+  if (beforeId) scrapeUrl += `&before=${encodeURIComponent(beforeId)}`;
   const res = await fetch(scrapeUrl);
   if (!res.ok) throw new Error(`واسط اسکرپ خطای ${res.status} برگرداند`);
   return res.text();
@@ -362,9 +363,30 @@ function parseTelegramPreviewPosts(html) {
   return posts;
 }
 
-async function scrapeChannelViaRelay() {
-  const html = await fetchTelegramPreviewHtml(TELEGRAM_CHANNEL_USERNAME);
-  return parseTelegramPreviewPosts(html).map((p) => ({ ...p, id: `scrape_${p.id}` }));
+// صفحه‌ی پیش‌نمایش تلگرام فقط ~۲۰ پیام آخر رو نشون می‌ده. اگه بین دو بار اسکرپ
+// بیشتر از این تعداد پیام جدید اومده باشه، با پارامتر «before» به صفحات قدیمی‌تر
+// می‌ریم تا به آخرین پیامی که از قبل داریم برسیم — این‌جوری هیچی گم نمی‌شه.
+const SCRAPE_MAX_PAGES = 15;
+
+async function scrapeChannelViaRelay(maxKnownMessageId) {
+  let all = [];
+  let beforeId = null;
+
+  for (let page = 0; page < SCRAPE_MAX_PAGES; page++) {
+    const html = await fetchTelegramPreviewHtml(TELEGRAM_CHANNEL_USERNAME, beforeId);
+    const pagePosts = parseTelegramPreviewPosts(html);
+    if (pagePosts.length === 0) break;
+
+    all.push(...pagePosts);
+
+    const oldestOnPage = Math.min(...pagePosts.map((p) => p.messageId));
+    if (oldestOnPage <= maxKnownMessageId) break; // به جایی رسیدیم که قبلاً داشتیم، دیگه لازم نیست عقب‌تر بریم
+    if (oldestOnPage <= 1) break;
+
+    beforeId = oldestOnPage;
+  }
+
+  return all.map((p) => ({ ...p, id: `scrape_${p.id}` }));
 }
 
 async function maybeScrapeChannel() {
@@ -376,11 +398,12 @@ async function maybeScrapeChannel() {
   await redis.set('scrape_last_at', String(now)); // فوری ثبت می‌کنیم تا درخواست‌های هم‌زمان دوباره اسکرپ نکنن
 
   try {
-    const scraped = await scrapeChannelViaRelay();
-    if (scraped.length === 0) return;
-
     const existingRaw = await redis.get('posts');
     let list = existingRaw ? JSON.parse(existingRaw) : [];
+    const maxKnownMessageId = list.reduce((max, p) => Math.max(max, p.messageId || 0), 0);
+
+    const scraped = await scrapeChannelViaRelay(maxKnownMessageId);
+    if (scraped.length === 0) return;
 
     for (const post of scraped) {
       const idx = list.findIndex((p) => p.id === post.id);
@@ -391,6 +414,7 @@ async function maybeScrapeChannel() {
     list.sort((a, b) => b.date - a.date);
     list = list.slice(0, MAX_STORED_POSTS);
     await redis.set('posts', JSON.stringify(list));
+    console.log(`اسکرپ کانال: ${scraped.length} پیام بررسی شد.`);
   } catch (e) {
     console.error('خطا در اسکرپ کانال:', e.message);
   }
@@ -886,6 +910,14 @@ app.get('*', (req, res, next) => {
 --------------------------------------------------------------------- */
 redis.connect().then(() => {
   app.listen(PORT, () => console.log(`اشراف روی پورت ${PORT} در حال اجراست`));
+
+  // اسکرپ خودکار در پس‌زمینه — مستقل از اینکه کسی سایت رو باز کرده باشه یا نه.
+  // این چیزیه که قبلاً نداشتیم و باعث می‌شد نیمه‌شب‌ها که کسی سایت رو باز نمی‌کرد،
+  // پیام‌های زیادی که بین چک‌ها می‌اومدن (بیشتر از ~۲۰ تای صفحه‌ی پیش‌نمایش) گم بشن.
+  setInterval(() => {
+    maybeScrapeChannel().catch((e) => console.error('خطا در اسکرپ زمان‌بندی‌شده:', e.message));
+  }, 60 * 1000); // هر ۱ دقیقه چک می‌شه؛ خودِ تابع با scrape_last_at از اسکرپ زیادی جلوگیری می‌کنه
+  maybeScrapeChannel().catch((e) => console.error('خطا در اولین اسکرپ:', e.message));
 }).catch((err) => {
   console.error('اتصال به Redis ناموفق بود:', err);
   process.exit(1);
